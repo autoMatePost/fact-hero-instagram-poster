@@ -1,359 +1,128 @@
-
-import os
-import time
-import json
-import requests
-from pathlib import Path
-from urllib.parse import quote
-from requests.exceptions import RequestException
-
-GRAPH_URL = "https://graph.instagram.com"
-
-STATE_FILE = Path("state.json")
-LINKS_FILE = Path("links.txt")
-
-MAX_CONTAINER_CHECKS = 20
-CONTAINER_CHECK_INTERVAL = 30
-PUBLISH_RETRIES = 3
-
-
-def get_reels():
-    folder = Path("images")
-
-    if not folder.exists():
-        raise RuntimeError("images folder does not exist.")
-
-    return sorted(
-        [
-            file for file in folder.iterdir()
-            if file.is_file() and file.suffix.lower() == ".mp4"
-        ],
-        key=lambda file: file.name.lower()
-    )
-
-
-def load_state():
-    if not STATE_FILE.exists():
-        return {"posted_files": []}
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-
-        posted = state.get("posted_files", [])
-
-        if not isinstance(posted, list):
-            raise ValueError("posted_files must be a list.")
-
-        return {"posted_files": posted}
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not safely read {STATE_FILE}: {exc}"
-        ) from exc
-
-
-def save_state(posted_files):
-    temp_file = STATE_FILE.with_suffix(".tmp")
-
-    with open(temp_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {"posted_files": posted_files},
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-    temp_file.replace(STATE_FILE)
-
-
-def save_link(filename, permalink):
-    existing = set()
-
-    if LINKS_FILE.exists():
-        with open(LINKS_FILE, "r", encoding="utf-8") as f:
-            existing = {line.strip() for line in f if line.strip()}
-
-    entry = f"{filename} -> {permalink}"
-
-    if entry not in existing:
-        with open(LINKS_FILE, "a", encoding="utf-8") as f:
-            f.write(entry + "\n")
-
-
-def api_error(response):
-    try:
-        return response.json()
-    except ValueError:
-        return response.text
-
-
-def wait_for_container(creation_id, token):
-    for attempt in range(MAX_CONTAINER_CHECKS):
-        response = requests.get(
-            f"{GRAPH_URL}/{creation_id}",
-            params={
-                "fields": "status_code,status",
-                "access_token": token,
-            },
-            timeout=60,
-        )
-
-        response.raise_for_status()
-        data = response.json()
-        status_code = data.get("status_code")
-
-        print(
-            f"Container check {attempt + 1}/"
-            f"{MAX_CONTAINER_CHECKS}: {data}"
-        )
-
-        if status_code in ("FINISHED", "PUBLISHED"):
-            return
-
-        if status_code in ("ERROR", "EXPIRED"):
-            raise RuntimeError(
-                f"Instagram container failed: {data}"
-            )
-
-        time.sleep(CONTAINER_CHECK_INTERVAL)
-
-    raise RuntimeError(
-        f"Container {creation_id} did not finish in time."
-    )
-
-
-def get_permalink(media_id, token):
-    response = requests.get(
-        f"{GRAPH_URL}/{media_id}",
-        params={
-            "fields": "permalink",
-            "access_token": token,
-        },
-        timeout=60,
-    )
-
-    if not response.ok:
-        print("Permalink API error:", api_error(response))
-
-    response.raise_for_status()
-    permalink = response.json().get("permalink")
-
-    if not permalink:
-        raise RuntimeError(
-            f"Permalink missing for media ID {media_id}."
-        )
-
-    return permalink
-
-
-def publish_reel(user_id, file_url, caption, token, filename):
-    print(f"\nUploading: {filename}")
-
-    response = requests.post(
-        f"{GRAPH_URL}/{user_id}/media",
-        params={
-            "media_type": "REELS",
-            "video_url": file_url,
-            "caption": caption,
-            "access_token": token,
-        },
-        timeout=60,
-    )
-
-    if not response.ok:
-        print("Container creation error:", api_error(response))
-
-    response.raise_for_status()
-    creation_id = response.json().get("id")
-
-    if not creation_id:
-        raise RuntimeError(f"Container ID missing for {filename}.")
-
-    print(f"Container created: {creation_id}")
-    wait_for_container(creation_id, token)
-
-    for attempt in range(1, PUBLISH_RETRIES + 1):
-        try:
-            response = requests.post(
-                f"{GRAPH_URL}/{user_id}/media_publish",
-                params={
-                    "creation_id": creation_id,
-                    "access_token": token,
-                },
-                timeout=60,
-            )
-
-        except RequestException as exc:
-            raise RuntimeError(
-                f"Publish outcome uncertain for {filename}. "
-                f"Check Instagram before retrying. Details: {exc}"
-            ) from exc
-
-        if response.ok:
-            media_id = response.json().get("id")
-
-            if not media_id:
-                raise RuntimeError(
-                    f"Published media ID missing: {response.text}"
-                )
-
-            permalink = get_permalink(media_id, token)
-            print(f"INSTAGRAM LINK: {permalink}")
-            return permalink
-
-        error_data = api_error(response)
-        print(
-            f"Publish attempt {attempt}/{PUBLISH_RETRIES}: "
-            f"{error_data}"
-        )
-
-        error = (
-            error_data.get("error", {})
-            if isinstance(error_data, dict)
-            else {}
-        )
-
-        if error.get("code") == 9 or error.get("error_subcode") == 2207042:
-            raise RuntimeError(
-                "Instagram publishing limit reached. "
-                "Try again after the limit resets."
-            )
-
-        if response.status_code not in (429, 500, 502, 503, 504):
-            raise RuntimeError(
-                f"Instagram rejected {filename}: {error_data}"
-            )
-
-        if attempt < PUBLISH_RETRIES:
-            time.sleep(30 * attempt)
-
-    raise RuntimeError(
-        f"Publish failed after {PUBLISH_RETRIES} attempts."
-    )
-
-
-def main():
-    token = os.environ["ZINDAGI_ACCESS_TOKEN"]
-    user_id = os.environ["ZINDAGI_USER_ID"]
-    repository = os.environ["GITHUB_REPOSITORY"]
-    branch = os.getenv("GITHUB_REF_NAME", "main")
-
-    caption = "#あらゆる追いかけっこを繰り広げる"
-
-    print("\nTesting Instagram account...")
-
-    test_response = requests.get(
-        f"{GRAPH_URL}/me",
-        params={
-            "fields": "user_id,username",
-            "access_token": token,
-        },
-        timeout=60,
-    )
-
-    print("Instagram account response:", test_response.text)
-    test_response.raise_for_status()
-
-    reels = get_reels()
-
-    if not reels:
-        raise RuntimeError("No MP4 files found in images folder.")
-
-    state = load_state()
-    posted_files = state["posted_files"]
-
-    pending_reels = [
-        reel for reel in reels
-        if reel.name not in posted_files
-    ]
-
-    print(f"Total MP4 files in images: {len(reels)}")
-    print(f"Already posted in state: {len(posted_files)}")
-    print(f"Pending Reels: {len(pending_reels)}")
-
-    if not pending_reels:
-        print("No pending Reels.")
+    print("India time:", current.strftime("%Y-%m-%d %H:%M:%S"))
+    print("Posting window: 4 PM to 8 PM IST")
+
+    if current.time() < START_TIME or current.time() >= STOP_TIME:
+        print("Outside posting window. No Reels will be posted.")
         return
 
-    requested = os.getenv("POST_COUNT", "5").strip().upper()
+    test = requests.get(
+        f"{GRAPH_URL}/me",
+        params={"fields": "user_id,username", "access_token": token},
+        timeout=60
+    )
+    print("Instagram account:", test.text)
+    test.raise_for_status()
 
-    if requested == "ALL":
-        count = len(pending_reels)
-    else:
-        try:
-            count = int(requested)
-        except ValueError:
-            raise ValueError("Enter a positive number or ALL.")
+    state = load_state()
+    batch_files = state["batch_files"]
+    batch_posted_files = state["batch_posted_files"]
+    daily_posts = state["daily_posts"]
 
-        if count < 1:
-            raise ValueError("POST_COUNT must be at least 1 or ALL.")
+    total_posted = len(batch_posted_files)
+    today_posted = int(daily_posts.get(today, 0))
 
-    selected_reels = pending_reels[:count]
+    if total_posted >= TOTAL_POST_LIMIT:
+        print("70 Reels from this batch have been posted. Automation stopped.")
+        return
 
-    print(f"Reels selected for this run: {len(selected_reels)}")
+    requested = get_requested_count()
+    pending_names = [
+        name for name in batch_files
+        if name not in batch_posted_files and (Path("images") / name).is_file()
+    ]
 
-    failed_files = []
+    daily_limit = len(pending_names) if requested == "ALL" else requested
+    remaining_today = max(0, daily_limit - today_posted)
+    remaining_batch = TOTAL_POST_LIMIT - total_posted
+
+    if remaining_today == 0:
+        print("Today's posting limit already reached.")
+        return
+
+    selected_names = pending_names[:min(remaining_today, remaining_batch)]
+
+    print("Files in this batch:", len(batch_files))
+    print("Pending Reels:", len(pending_names))
+    print("Posted from this batch:", total_posted)
+    print("Posted today:", today_posted)
+    print("Today's limit:", daily_limit)
+    print("Selected this run:", len(selected_names))
+
+    if not selected_names:
+        print("No pending Reels from this batch.")
+        return
+
     success_count = 0
+    failed_files = []
+    caption = "#あらゆる追いかけっこを繰り広げる"
 
-    for index, reel in enumerate(selected_reels, start=1):
-        safe_filename = quote(reel.name, safe="")
-        safe_branch = quote(branch, safe="")
+    for index, filename in enumerate(selected_names, start=1):
+        if now_ist().time() >= STOP_TIME:
+            print("8 PM reached. Stopping.")
+            break
 
+        reel = Path("images") / filename
         file_url = (
-            f"https://raw.githubusercontent.com/"
-            f"{repository}/{safe_branch}/images/{safe_filename}"
+            f"https://raw.githubusercontent.com/{repository}/"
+            f"{quote(branch, safe='')}/images/{quote(filename, safe='')}"
         )
 
-        print("\n==========================================")
-        print(f"REEL {index}/{len(selected_reels)}")
-        print(f"FILE: {reel.name}")
-        print("==========================================")
+        print(f"\nREEL {index}/{len(selected_names)}: {filename}")
 
         try:
-            permalink = publish_reel(
-                user_id,
-                file_url,
-                caption,
-                token,
-                reel.name
+            media_id, permalink = publish_reel(
+                user_id, file_url, caption, token, filename
             )
 
-            # Save link and state before deleting the file.
-            save_link(reel.name, permalink)
+            save_link(filename, permalink, media_id)
+            if filename not in batch_posted_files:
+                batch_posted_files.append(filename)
 
-            if reel.name not in posted_files:
-                posted_files.append(reel.name)
+            daily_posts[today] = int(daily_posts.get(today, 0)) + 1
+            save_state({
+                "batch_files": batch_files,
+                "batch_posted_files": batch_posted_files,
+                "daily_posts": daily_posts
+            })
 
-            save_state(posted_files)
-
-            # Delete only after successful publish and local state/link save.
-            reel.unlink()
-
-            print(f"SUCCESS: {reel.name}")
-            print(f"LINK: {permalink}")
-            print(f"Deleted from images: {reel.name}")
+            if reel.exists():
+                reel.unlink()
 
             success_count += 1
+            print("SUCCESS:", filename)
+            print("LINK:", permalink or f"Permalink pending; media ID: {media_id}")
+            print("Deleted from images.")
 
         except Exception as exc:
-            print(f"FAILED: {reel.name}")
-            print(f"REASON: {exc}")
-            print("Keeping the file and continuing to next Reel.")
-            failed_files.append(reel.name)
+            print("FAILED:", filename)
+            print("REASON:", exc)
+            print("Keeping file for a future run.")
+            failed_files.append(filename)
 
-    print("\n==========================================")
-    print(f"Successful Reels: {success_count}")
-    print(f"Failed Reels: {len(failed_files)}")
-    print("Links saved in links.txt.")
-    print("Successfully posted files were removed from this run's images folder.")
-    print("==========================================")
+        if len(batch_posted_files) >= TOTAL_POST_LIMIT:
+            print("70 successful Reels from this batch reached. Stopping permanently.")
+            break
 
-    if failed_files:
-        print("Failed files:")
-        for filename in failed_files:
-            print(f"- {filename}")
+        if today_posted + success_count >= daily_limit:
+            print("Today's successful-post limit reached.")
+            break
 
+        if index < len(selected_names):
+            gap = random.randint(min_gap, max_gap)
+            now = now_ist()
+            stop = datetime.combine(now.date(), STOP_TIME, tzinfo=IST)
+            remaining_seconds = (stop - now).total_seconds()
 
-if __name__ == "__main__":
-    main()
+            if remaining_seconds <= gap:
+                print("Not enough time for another Reel before 8 PM.")
+                break
+
+            print(f"Waiting {gap} seconds before next Reel.")
+            time.sleep(gap)
+
+    print("\n========== DAILY SUMMARY ==========")
+    print("Successful this run:", success_count)
+    print("Failed this run:", len(failed_files))
+    print("Successfully posted today:", daily_posts.get(today, 0))
+    print("Successfully posted from this batch:", len(batch_posted_files))
+    print("Remaining to 70:", max(0, TOTAL_POST_LIMIT - len(batch_posted_files)))
