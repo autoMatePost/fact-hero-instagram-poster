@@ -1,4 +1,4 @@
-import os
+﻿import os
 import time
 import json
 import random
@@ -21,7 +21,7 @@ STOP_TIME = dt_time(20, 0)
 MAX_CONTAINER_CHECKS = 20
 CONTAINER_CHECK_INTERVAL = 30
 PUBLISH_RETRIES = 3
-TOTAL_POST_LIMIT = 70
+TOTAL_POST_LIMIT = 72
 
 
 def now_ist():
@@ -55,7 +55,7 @@ def load_state():
             old_state = json.load(f)
 
         # Ignore legacy posted_files history. Start this 70-Reel batch fresh.
-        if "batch_files" not in old_state:
+        if "batch_files" not in old_state or not old_state.get("batch_files"):
             return {
                 "batch_files": current_files,
                 "batch_posted_files": [],
@@ -225,7 +225,7 @@ def publish_reel(user_id, file_url, caption, token, filename):
 
 def get_requested_count():
     manual = os.getenv("MANUAL_POST_COUNT", "").strip().upper()
-    requested = manual or os.getenv("DAILY_POST_COUNT", "15").strip().upper()
+    requested = manual or os.getenv("DAILY_POST_COUNT", "20").strip().upper()
 
     if requested == "ALL":
         return "ALL"
@@ -248,8 +248,8 @@ def main():
     branch = os.getenv("GITHUB_REF_NAME", "main")
 
     min_gap = int(os.getenv("MIN_GAP_SECONDS", "120"))
-    max_gap = int(os.getenv("MAX_GAP_SECONDS", "360"))
-    if min_gap < 120 or max_gap > 360 or max_gap < min_gap:
+    max_gap = int(os.getenv("MAX_GAP_SECONDS", "120"))
+    if min_gap < 120 or max_gap > 120 or max_gap < min_gap:
         raise ValueError("Gap must be between 120 and 360 seconds.")
 
     current = now_ist()
@@ -278,7 +278,7 @@ def main():
     today_posted = int(daily_posts.get(today, 0))
 
     if total_posted >= TOTAL_POST_LIMIT:
-        print("70 Reels from this batch have been posted. Automation stopped.")
+        print("72 Reels from this batch have been posted. Automation stopped.")
         return
 
     requested = get_requested_count()
@@ -310,7 +310,7 @@ def main():
 
     success_count = 0
     failed_files = []
-    caption = "#あらゆる追いかけっこを繰り広げる"
+    caption = "#ã‚ã‚‰ã‚†ã‚‹è¿½ã„ã‹ã‘ã£ã“ã‚’ç¹°ã‚Šåºƒã’ã‚‹"
 
     for index, filename in enumerate(selected_names, start=1):
         if now_ist().time() >= STOP_TIME:
@@ -387,3 +387,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
