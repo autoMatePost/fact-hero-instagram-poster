@@ -21,7 +21,7 @@ STOP_TIME = dt_time(20, 0)
 MAX_CONTAINER_CHECKS = 20
 CONTAINER_CHECK_INTERVAL = 30
 PUBLISH_RETRIES = 3
-TOTAL_POST_LIMIT = 72
+TOTAL_POST_LIMIT = 54
 
 
 def now_ist():
@@ -381,11 +381,13 @@ def main():
     print("Failed this run:", len(failed_files))
     print("Successfully posted today:", daily_posts.get(today, 0))
     print("Successfully posted from this batch:", len(batch_posted_files))
-    print("Remaining to 70:", max(0, TOTAL_POST_LIMIT - len(batch_posted_files)))
+    print("Remaining to 54:", max(0, TOTAL_POST_LIMIT - len(batch_posted_files)))
     print("===================================")
 
 
 if __name__ == "__main__":
     main()
+
+
 
 
